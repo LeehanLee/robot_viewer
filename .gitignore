@@ -3,6 +3,7 @@ node_modules/
 
 # Build output
 dist/
+dist-lib/
 build/
 
 # Logs
@@ -28,3 +29,5 @@ Thumbs.db
 # Cache
 .cache/
 
+token
+robot-viewer-*
