@@ -9,10 +9,17 @@
  *     angleUnit="deg"
  *     toolbar={{ visual: true, collision: true, joints: true, theme: true }}  // 白名单，不传=全显示
  *     display={{ visual: true, grid: true }}                                    // 受控显示状态
+ *     cameraPosition={[1.6, 1.8, 0]}                                             // 初始相机位置（场景坐标，Y 朝上）
+ *     cameraTarget={[0, 0.84, 0]}                                                // 相机观察目标点
  *     ref={viewerRef}
  *   />
  *
  * 通过 ref 暴露 RobotViewerCore 全部方法（setJointValue / setBasePose / setDisplay / ...）。
+ *
+ * cameraPosition / cameraTarget：
+ *   - 传了：在 core 创建后、**首帧渲染之前**即应用，并在引擎"模型就绪后自适应"之后自动回设
+ *     （引擎那一步会覆盖外部指定的相机，表现为视角跳变；两者合起来保证视角自始至终稳定）；
+ *   - 没传：由引擎自适应取景（fitCamera），网格会先以引擎默认视角 (2,2,2) 出现、加载完成后再定位。
  */
 import React, { forwardRef, useEffect, useMemo, useRef, useState } from 'react';
 import { RobotViewerCore } from './RobotViewerCore.js';
@@ -38,6 +45,7 @@ const RobotViewer = forwardRef(function RobotViewer(props, ref) {
         darkSurface,
         darkCanvas,
         lightCanvas,
+        groundLevel,
         cameraPosition,
         cameraTarget,
         style,
@@ -55,6 +63,10 @@ const RobotViewer = forwardRef(function RobotViewer(props, ref) {
 
     const containerRef = useRef(null);
     const [core, setCore] = useState(null);
+
+    // 相机 props 的最新值：core 只创建一次，用 ref 让「首帧前设置」与「modelReady 回设」都读到最新值
+    const cameraRef = useRef({ position: cameraPosition, target: cameraTarget });
+    cameraRef.current = { position: cameraPosition, target: cameraTarget };
 
     // ==================== 内部状态（未受控时的自管状态） ====================
 
@@ -88,16 +100,38 @@ const RobotViewer = forwardRef(function RobotViewer(props, ref) {
             theme: theme || 'dark',
             lang: lang || 'zh-CN',
             darkCanvas,
-            lightCanvas
+            lightCanvas,
+            groundLevel
         });
         instance.onJointEvent = (event) => {
             callbacksRef.current.onJointEvent?.(event);
             jointPanelRef.current?.handleJointEvent(event);
         };
+
+        // (1) 首帧之前先把相机放到调用方指定的位姿。
+        //     地面网格在 core 构造时就已建好并立即开始渲染，而引擎默认相机是 (2,2,2) 看向原点；
+        //     若等到 loadUrdf() 完成后再设相机，会先以默认视角画出网格、加载完再"闪"一下切过去。
+        //     setCameraView 不依赖模型，可在此同步调用；_startLoop() 只是登记了 rAF，
+        //     本行会在首个 rAF 回调之前执行 ⇒ 第一帧渲染即使用目标视角。
+        const cam = cameraRef.current;
+        if (cam.position) instance.setCameraView(cam.position, cam.target);
+
+        // (2) 引擎在模型就绪后约 1s 还会自行再自适应一次取景（内部 updateEnvironment(true)
+        //     → fitCameraToModel），会覆盖上面（以及加载完成时）设置的相机，表现为"模型出来后视角跳一下"。
+        //     引擎在覆盖之后会同步 emit('modelReady')，此处把相机设回即可；且引擎的 redraw() 只置脏标记、
+        //     真正绘制发生在下一帧，所以同步设回不会把中间那一帧画出来（无闪烁）。
+        //     未传 cameraPosition 时不干预（走调用方/引擎的自适应）。
+        const reapplyCamera = () => {
+            const { position, target } = cameraRef.current;
+            if (position) instance.setCameraView(position, target);
+        };
+        instance.sceneManager.on('modelReady', reapplyCamera);
+
         setDisplayState(instance.getDisplay());
         setCore(instance);
 
         return () => {
+            instance.sceneManager.off('modelReady', reapplyCamera);
             setCore(null);
             setDisplayState(null);
             instance.dispose();
@@ -141,7 +175,19 @@ const RobotViewer = forwardRef(function RobotViewer(props, ref) {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [core, lang]);
 
-    // 5. 加载模型（urdfUrl / packages 变化时重新加载）
+    // 5. groundLevel prop 变化 → 同步地面固定高度（首次已由 core 构造时应用，跳过）
+    const groundLevelSyncedRef = useRef(false);
+    useEffect(() => {
+        if (!core) return;
+        if (!groundLevelSyncedRef.current) {
+            groundLevelSyncedRef.current = true;
+            return;
+        }
+        core._setGroundLevel(groundLevel);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [core, groundLevel]);
+
+    // 6. 加载模型（urdfUrl / packages 变化时重新加载）
     const packagesKey = useMemo(() => JSON.stringify(packages || {}), [packages]);
 
     useEffect(() => {

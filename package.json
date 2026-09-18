@@ -1,6 +1,6 @@
 {
   "name": "robot-viewer",
-  "version": "1.4.1",
+  "version": "1.4.9",
   "description": "Web-based robot model viewer supporting URDF, MJCF, and USD formats",
   "type": "module",
   "main": "./dist-lib/index.js",

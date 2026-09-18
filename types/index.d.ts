@@ -133,6 +133,12 @@ export interface RobotViewerProps {
     darkCanvas?: string | number;
     /** 浅色主题 3D 画布背景色（缺省用引擎默认白） */
     lightCanvas?: string | number;
+    /**
+     * 地面/参考网格固定高度（米），默认 0：网格从第一帧起固定不动（零跳变）。
+     * 模型脚底不在 0 时传实际高度；传 null 恢复引擎"自动对齐模型脚底"行为（加载期网格会移动）。
+     * 运行期修改此 prop 会即时生效。
+     */
+    groundLevel?: number | null;
     /** 画布背景色（0xRRGGBB 或 [r,g,b]），默认跟随页面 data-theme */
     background?: number | [number, number, number];
     /** 初始相机位置（场景坐标，Y 朝上），默认加载后自适应 */
@@ -220,7 +226,8 @@ export interface RobotViewerHandle {
     getTheme(): ViewerTheme;
     /** 界面语言 */
     setLanguage(lang: ViewerLang): void;
-    getLanguage(): ViewerLang;    /** 底层场景管理器（高级用法） */
+    getLanguage(): ViewerLang;
+    /** 底层场景管理器（高级用法） */
     readonly sceneManager: any;
     /** 底层位姿控制器（高级用法） */
     readonly poseController: any;
@@ -248,6 +255,8 @@ export declare class RobotViewerCore implements RobotViewerHandle {
         darkCanvas?: string | number;
         /** 浅色主题画布背景（缺省用引擎默认白） */
         lightCanvas?: string | number;
+        /** 地面/网格固定高度（默认 0；null = 引擎自动对齐） */
+        groundLevel?: number | null;
     });
     angleUnit: AngleUnit;
     /** 当前显示开关状态 */

@@ -14,6 +14,10 @@
  *   - setDisplay / setVisual 等    视觉/碰撞/惯量/质心/坐标轴/关节轴/阴影/光照/网格开关
  *   - setTheme / setLanguage       主题与语言（工具栏按钮用）
  *   - getJointList / getPose / resetJoints / fitCamera / dispose 等
+ *
+ * 另外做了一处「网格稳定」补偿：引擎 updateEnvironment() 每次都会把地面/参考网格对齐到模型当前
+ * 包围盒最低点，动画播放期间重算会让网格跳一下；本类把站立姿态下的高度固定为基准（见
+ * _installGroundLevelGuard），不改引擎源码。
  */
 import './ssrShim.js'; // 必须最先执行（i18n 顶层实例化依赖 navigator/localStorage）
 import * as THREE from 'three';
@@ -94,6 +98,7 @@ export class RobotViewerCore {
      * @param {'zh-CN'|'en'} [options.lang] - 界面语言（i18n）
      * @param {string|number} [options.darkCanvas='#0b1120'] - 深色主题画布背景（覆盖引擎默认灰 #505050）
      * @param {string|number} [options.lightCanvas] - 浅色主题画布背景（缺省用引擎默认白）
+     * @param {number|null} [options.groundLevel=0] - 地面/网格固定高度（米）；null = 引擎自动对齐模型脚底
      */
     constructor(container, options = {}) {
         if (!container) {
@@ -121,6 +126,13 @@ export class RobotViewerCore {
         this.sceneManager = new SceneManager(canvas);
         this.poseController = new PoseController(this.sceneManager);
         this.sceneManager.setPoseController(this.poseController);
+
+        // 地面/网格固定高度（见 _installGroundLevelGuard）：
+        //   数字（默认 0）= 固定高度，网格永不移动；null = 恢复引擎"对齐模型脚底"自动行为
+        this._groundLevel = options.groundLevel === undefined ? 0 : options.groundLevel;
+        this._rawUpdateEnvironment = null;
+        this._rawUpdateGroundPosition = null;
+        this._installGroundLevelGuard();
 
         // i18n（FileHandler 等既有模块通过 window.i18n 访问文案）
         if (typeof window !== 'undefined' && !window.i18n) {
@@ -178,6 +190,90 @@ export class RobotViewerCore {
         this._rafId = requestAnimationFrame(tick);
     }
 
+    // ==================== 地面高度守卫 ====================
+
+    /**
+     * 固定地面/参考网格的高度，彻底消除「网格跳变」
+     *
+     * 引擎 `SceneManager.updateEnvironment()` 每次都会把地面与参考网格对齐到**模型当前包围盒的最低点**，
+     * 它在模型刚加入（0ms）、模型就绪（约 1s）、每次 fitCamera 时都会被调用；而 URDF 的 mesh 是
+     * 分批异步到达的，各时刻算出的 minY 并不相同 ⇒ 网格在加载期间会随包围盒变化反复移动。
+     * 机器人不动、相机不动、只有背景网格跳，就是这个原因。
+     *
+     * 做法（唯一能保证零跳变的方案）：地面高度在 core 构造时就定死（默认 0，可用 groundLevel 配置），
+     * 之后拦截引擎的每次重算、一律还原为该固定值——网格从第一帧起就在目标高度，永远不会动。
+     * 传 groundLevel=null 可恢复引擎"对齐模型脚底"的自动行为（接受加载期的可见移动）。
+     * 未修改引擎源码。
+     */
+    _installGroundLevelGuard() {
+        const sm = this.sceneManager;
+        if (!sm || this._groundLevel == null) return;
+        const level = this._groundLevel;
+
+        // 1) 拦截主路径：updateEnvironment 内部直接改写 groundPlane/referenceGrid 的 y
+        if (typeof sm.updateEnvironment === 'function') {
+            this._rawUpdateEnvironment = sm.updateEnvironment.bind(sm);
+            sm.updateEnvironment = (fitCamera) => {
+                this._rawUpdateEnvironment(fitCamera);
+                this._applyGroundLevel();
+            };
+        }
+
+        // 2) 防御：EnvironmentManager.updateGroundPosition 也可能被其他模块调用
+        const em = sm.environmentManager;
+        if (em && typeof em.updateGroundPosition === 'function') {
+            this._rawUpdateGroundPosition = em.updateGroundPosition.bind(em);
+            em.updateGroundPosition = () => {
+                this._rawUpdateGroundPosition(level);
+            };
+        }
+
+        // 3) 构造即落位：网格从第一帧就在目标高度
+        this._applyGroundLevel();
+    }
+
+    /** 把地面与参考网格放到固定高度（已在位则不动） */
+    _applyGroundLevel() {
+        const sm = this.sceneManager;
+        const level = this._groundLevel;
+        if (level == null || !sm || !sm.groundPlane) return;
+        if (sm.groundPlane.position.y === level
+            && (!sm.referenceGrid || sm.referenceGrid.position.y === level)) {
+            return;
+        }
+        sm.groundPlane.position.y = level;
+        if (sm.referenceGrid) {
+            sm.referenceGrid.position.y = level;
+            sm.referenceGrid.updateMatrixWorld(true);
+        }
+        sm.redraw();
+    }
+
+    /**
+     * 应用新的地面固定高度（内部方法，由 React 层在 groundLevel prop 变化时调用）
+     * @param {number|null} level - 数字 = 固定到该高度；null = 恢复引擎"对齐模型脚底"自动行为
+     */
+    _setGroundLevel(level) {
+        if (level != null && !Number.isFinite(Number(level))) return;
+        // 先还原被拦截的方法，再按新语义重新安装守卫
+        const rawUpdateEnvironment = this._rawUpdateEnvironment;
+        if (rawUpdateEnvironment) {
+            this.sceneManager.updateEnvironment = rawUpdateEnvironment;
+            this._rawUpdateEnvironment = null;
+        }
+        if (this._rawUpdateGroundPosition) {
+            this.sceneManager.environmentManager.updateGroundPosition = this._rawUpdateGroundPosition;
+            this._rawUpdateGroundPosition = null;
+        }
+        this._groundLevel = level == null ? null : Number(level);
+        if (this._groundLevel != null) {
+            this._installGroundLevelGuard();
+        } else if (rawUpdateEnvironment) {
+            // 恢复自动对齐：立刻让引擎按当前模型对齐一次
+            rawUpdateEnvironment.call(this.sceneManager, false);
+        }
+    }
+
     // ==================== 模型加载 ====================
 
     /**
@@ -201,7 +297,7 @@ export class RobotViewerCore {
 
         this.model = model;
         this.poseController.setModel(model);
-        this.sceneManager.addModel(model); // addModel 内部会移除旧模型
+        this.sceneManager.addModel(model); // addModel 内部会移除旧模型（地面高度由守卫保持固定）
 
         if (options.showGround != null) {
             this.sceneManager.setGroundVisible(!!options.showGround);
@@ -624,6 +720,17 @@ export class RobotViewerCore {
 
         this._unsubscribeJoints?.();
         this.onJointEvent = null;
+
+        // 拆除地面高度守卫（还原引擎原方法）
+        if (this._rawUpdateEnvironment) {
+            this.sceneManager.updateEnvironment = this._rawUpdateEnvironment;
+            this._rawUpdateEnvironment = null;
+        }
+        if (this._rawUpdateGroundPosition) {
+            this.sceneManager.environmentManager.updateGroundPosition = this._rawUpdateGroundPosition;
+            this._rawUpdateGroundPosition = null;
+        }
+        this._groundLevel = null;
 
         try {
             if (this.sceneManager.currentModel) {
